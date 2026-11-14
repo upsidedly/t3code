@@ -1,13 +1,10 @@
 import { createMemoryHistory } from "@tanstack/react-router";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
-import { MessageId, ORCHESTRATION_V2_WS_METHODS, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, RunId, ThreadId } from "@t3tools/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 import type * as Context from "effect/Context";
-import * as Effect from "effect/Effect";
 import { expect, it, vi } from "vite-plus/test";
-import { page, userEvent } from "vite-plus/test/browser";
-
-import "~/index.css";
+import { cdp, page, userEvent } from "vite-plus/test/browser";
 
 import { AppRoot } from "~/AppRoot";
 // The route loads ChatView lazily, and its first transform (React Compiler over ~4k lines)
@@ -16,19 +13,27 @@ import "~/components/ChatView";
 import { DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { selectThreadDiffPanelSelection, useDiffPanelStore } from "~/diffPanelStore";
 import { __setClientSettingsForTests } from "~/hooks/useSettings";
+import { environmentContextRecord } from "~/lib/composerContextRecords";
+import { usePromptStashStore } from "~/promptStashStore";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { getRouter } from "~/router";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
+import { environmentThreadDetails } from "~/state/threads";
 import {
   ENVIRONMENT_ID,
   PROJECT_ID,
+  answerAssetUrls,
+  assistantItem,
   dispatchedCommands,
+  emitThreadEvent,
+  hasPendingAssetUrl,
   installFakeEnvironment,
   rejectPendingCommand,
   threadWithHistory,
+  threadWithQuestion,
   type FakeDriver,
 } from "../../test/fakeEnvironment";
 import { act, fakeTimers, render } from "../../test/render";
-import { closeThreadFind, openThreadFindOnQuery, useThreadFindStore } from "./chat/threadFindStore";
 
 // The socket is the only fake layer; see test/appScenarios.renders.tsx.
 vi.mock("../../../../packages/client-runtime/src/connection/driver.ts", async (importOriginal) => {
@@ -45,95 +50,116 @@ vi.mock(import("~/rpc/requestLatencyState"), async (original) => ({
   trackRpcRequestSent: () => {},
 }));
 
-it("dismisses a previous sidebar message find when the sidebar search changes or clears", async () => {
-  await page.viewport(1400, 900);
-  const thread = threadWithHistory("sidebar-search", 1);
-  const messageId = MessageId.make(`${thread.id}-assistant-0`);
-  using _environment = installFakeEnvironment([thread], {
-    config: { threadFind: true },
-    rpc: {
-      [ORCHESTRATION_V2_WS_METHODS.searchThreads]: ({ query }) =>
-        Effect.succeed({
-          matches:
-            query === "Sidebar.tsx"
-              ? [
-                  {
-                    threadId: thread.id,
-                    projectId: PROJECT_ID,
-                    source: "assistant",
-                    snippet: "checked Sidebar.tsx",
-                    messageId,
-                    messageCreatedAt: null,
-                  },
-                ]
-              : [],
-        }),
-      [ORCHESTRATION_V2_WS_METHODS.searchThread]: () =>
-        Effect.succeed({
-          snapshotSequence: 1,
-          totalMatches: 1,
-          activeIndex: 0,
-          match: { entryId: messageId, runId: thread.runs[0]!.id, occurrence: 0 },
-        }),
-    },
-  });
-  closeThreadFind();
-  using _find = { [Symbol.dispose]: closeThreadFind };
+it("a machine chip stashed in one thread restores with its machine in another", async () => {
+  const other = threadWithHistory("thread-stash-restore", 1);
+  const asking = threadWithQuestion("thread-stash-question", "Which file should change?");
+  using _environment = installFakeEnvironment([other, asking]);
   __setClientSettingsForTests({
     ...DEFAULT_CLIENT_SETTINGS,
     onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const draftId = DraftId.make("draft-stash-machine");
+  const machine = environmentContextRecord(EnvironmentId.make("environment-build"), "Build box");
+  const drafts = useComposerDraftStore.getState();
+  drafts.setProjectDraftThreadId(scopeProjectRef(ENVIRONMENT_ID, PROJECT_ID), draftId, {
+    threadId: ThreadId.make("thread-stash-machine"),
+  });
+  drafts.setPrompt(draftId, "Deploy on ");
+  drafts.addEnvironmentContexts(draftId, [machine]);
+  const router = getRouter(createMemoryHistory({ initialEntries: [`/draft/${draftId}`] }));
+  await router.load();
+  await using _app = await render(<AppRoot router={router} />, {
+    // AppRoot brings its own router.
+    router: false,
+  });
+  const editor = page.getByTestId("composer-editor");
+  const pressStashShortcut = async () => {
+    await userEvent.click(editor);
+    await userEvent.keyboard("{ControlOrMeta>}s{/ControlOrMeta}");
+  };
+  await vi.waitFor(() => expect(editor.element().textContent).toContain("Deploy on"));
+  // A draft can't stash until the shell snapshot lists its project.
+  await expect.element(page.getByText("render", { exact: true }).first()).toBeVisible();
+  await pressStashShortcut();
+  await vi.waitFor(() => expect(usePromptStashStore.getState().entries).toHaveLength(1));
+
+  // An answer carries no machines, so an open question refuses the restore and keeps the entry.
+  await router.navigate({ to: `/${ENVIRONMENT_ID}/${asking.id}` });
+  await expect.element(page.getByText("Which file should change?")).toBeVisible();
+  await userEvent.click(page.getByRole("button", { name: /^Stashed prompts/ }));
+  await userEvent.click(page.getByRole("button", { name: /^Restore stashed prompt/ }));
+  await vi.waitFor(() =>
+    expect(document.body.textContent).toContain("Stashed machines can't go in an answer"),
+  );
+  expect(usePromptStashStore.getState().entries).toHaveLength(1);
+
+  await router.navigate({ to: `/${ENVIRONMENT_ID}/${other.id}` });
+  await expect.element(page.getByText("Answer 0 for thread-stash-restore.")).toBeVisible();
+  await pressStashShortcut();
+
+  await vi.waitFor(() => expect(editor.element().textContent).toContain("Deploy on"));
+  expect(
+    useComposerDraftStore.getState().getComposerDraft(scopeThreadRef(ENVIRONMENT_ID, other.id))
+      ?.environmentContexts,
+  ).toEqual([machine]);
+  expect(
+    useComposerDraftStore.getState().getComposerDraft(draftId)?.environmentContexts ?? [],
+  ).toEqual([]);
+});
+
+it("a question that opens while a stashed file is checked keeps a machine stash", async () => {
+  const thread = threadWithHistory("thread-stash-late-question", 1);
+  const asking = threadWithQuestion("thread-stash-late-question", "Which file should change?");
+  const [request] = asking.runtimeRequests ?? [];
+  const question = asking.items.at(-1);
+  if (!request || !question) throw new Error("threadWithQuestion has no question");
+  using _environment = installFakeEnvironment([thread]);
+  __setClientSettingsForTests({
+    ...DEFAULT_CLIENT_SETTINGS,
+    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
+  });
+  usePromptStashStore.getState().stashEntry({
+    id: "stash-late-question",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    prompt: "Deploy on ",
+    attachments: [],
+    files: [
+      {
+        id: "file-notes",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        attachmentId: "attachment-notes",
+        environmentId: ENVIRONMENT_ID,
+      },
+    ],
+    droppedImageNames: [],
+    records: [environmentContextRecord(EnvironmentId.make("environment-build"), "Build box")],
   });
   const router = getRouter(
     createMemoryHistory({ initialEntries: [`/${ENVIRONMENT_ID}/${thread.id}`] }),
   );
   await router.load();
-  await using screen = await render(<AppRoot router={router} />, {
+  await using _app = await render(<AppRoot router={router} />, {
     // AppRoot brings its own router.
     router: false,
   });
-  const search = screen.getByRole("combobox", { name: "Search threads" });
-  await expect.element(search).toBeVisible();
-  const find = screen.getByRole("searchbox", { name: "Find in thread" });
-  const assertFindClosed = async () => {
-    await expect.element(find).not.toBeInTheDocument();
-    expect(CSS.highlights.has("t3-thread-find")).toBe(false);
-    expect(CSS.highlights.has("t3-thread-find-active")).toBe(false);
-  };
-  const selectMessageResult = async () => {
-    await userEvent.fill(search, "Sidebar.tsx");
-    await userEvent.click(screen.getByRole("option", { name: new RegExp(thread.title) }));
-    await expect.element(find).toHaveValue("Sidebar.tsx");
-    await vi.waitFor(() => expect(CSS.highlights.get("t3-thread-find-active")?.size).toBe(1));
-  };
-  const openMessageFind = () =>
-    act(() =>
-      openThreadFindOnQuery(`${ENVIRONMENT_ID}:${thread.id}`, { query: "Sidebar.tsx" }, "sidebar"),
-    );
+  await expect.element(page.getByText("Answer 0 for thread-stash-late-question.")).toBeVisible();
+  await userEvent.click(page.getByRole("button", { name: /^Stashed prompts/ }));
+  await userEvent.click(page.getByRole("button", { name: /^Restore stashed prompt/ }));
 
-  await selectMessageResult();
-  await userEvent.fill(search, thread.title);
-  await assertFindClosed();
+  // The question opens while the restore still waits on the server's file check.
+  await vi.waitFor(() => expect(hasPendingAssetUrl()).toBe(true));
+  await emitThreadEvent(thread.id, { type: "turn-item.updated", payload: question });
+  await emitThreadEvent(thread.id, { type: "runtime-request.updated", payload: request });
+  await expect.element(page.getByText("Which file should change?")).toBeVisible();
+  await answerAssetUrls();
 
-  await openMessageFind();
-  await userEvent.click(screen.getByRole("button", { name: "Clear thread search" }));
-  await expect.element(search).toHaveValue("");
-  await assertFindClosed();
-
-  await userEvent.fill(search, thread.title);
-  await openMessageFind();
-  await userEvent.click(search);
-  await userEvent.keyboard("{Escape}");
-  await expect.element(search).toHaveValue("");
-  await assertFindClosed();
-
-  await userEvent.fill(search, thread.title);
-  await openMessageFind();
-  await userEvent.clear(search);
-  await expect.element(search).toHaveValue("");
-  await assertFindClosed();
-
-  await selectMessageResult();
-  expect(useThreadFindStore.getState().query).toBe("Sidebar.tsx");
+  await vi.waitFor(() =>
+    expect(document.body.textContent).toContain("Stashed machines can't go in an answer"),
+  );
+  expect(usePromptStashStore.getState().entries).toHaveLength(1);
+  usePromptStashStore.getState().takeEntry("stash-late-question");
 });
 
 it("a new draft does not load its reserved thread before the server lists it", async () => {
@@ -397,4 +423,56 @@ it("opening a thread or returning to the window on a touch tablet does not focus
   vi.advanceTimersToNextFrame();
   vi.advanceTimersToNextFrame();
   expect(document.activeElement).not.toBe(composer.element());
+});
+
+it("a mounted thread view lets go of the thread structures it has replaced", async () => {
+  // Items are shared with the fixture, so a reopen's snapshot also carries the earlier updates.
+  const history = threadWithHistory("updated", 3);
+  const items = [...history.items];
+  const updated = { ...history, items };
+  const other = threadWithHistory("other", 3);
+  using _environment = installFakeEnvironment([updated, other]);
+  __setClientSettingsForTests({
+    ...DEFAULT_CLIENT_SETTINGS,
+    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const router = getRouter(createMemoryHistory({ initialEntries: ["/"] }));
+  await router.load();
+  await using _app = await render(<AppRoot router={router} />, { router: false });
+  const open = async (threadId: ThreadId, text: string) => {
+    await act(() =>
+      router.navigate({
+        to: "/$environmentId/$threadId",
+        params: { environmentId: ENVIRONMENT_ID, threadId },
+      }),
+    );
+    await expect.element(page.getByText(text).first()).toBeVisible();
+  };
+  const structureAtom = environmentThreadDetails.quietThreadAtom(
+    scopeThreadRef(ENVIRONMENT_ID, updated.id),
+  );
+
+  // Each round, a new answer arrives while the thread is shown, then the user switches away.
+  const shown: Array<WeakRef<object>> = [];
+  await open(other.id, "Answer 2 for other.");
+  for (let round = 0; round < 6; round++) {
+    await open(updated.id, round === 0 ? "Answer 2 for updated." : `Update ${round - 1}.`);
+    const update = assistantItem(
+      updated.id,
+      RunId.make("updated-run-2"),
+      `updated-update-${round}`,
+      6 + round,
+      `Update ${round}.`,
+    );
+    items.push(update);
+    await act(() => emitThreadEvent(updated.id, { type: "turn-item.updated", payload: update }));
+    await expect.element(page.getByText(`Update ${round}.`)).toBeVisible();
+    shown.push(new WeakRef(appAtomRegistry.get(structureAtom)!.projection));
+    await open(other.id, "Answer 2 for other.");
+  }
+  await cdp().send("HeapProfiler.collectGarbage");
+
+  // The thread keeps its latest structure, and the timeline may remember the one before it.
+  const kept = shown.slice(0, -2).flatMap((structure, round) => (structure.deref() ? [round] : []));
+  expect(kept).toEqual([]);
 });
